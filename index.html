@@ -942,9 +942,7 @@ step({
     const status = el("p", { class: "small" }, "Analysing the recordings…");
     const holder = el("div");
     stage.append(status, holder);
-    const CFG = [
-      { key: "clarinet", name: "Clarinet B♭4", T: 1025, K: 15, start: 0.0, frames: 43, f0: 466.16, color: "s1" },
-      { key: "guitar", name: "Steel guitar D3", T: 3000, K: 12, start: 0.1, frames: 30, f0: 146.83, color: "s2" }];
+    const CFG = [CLARINET, GUITAR];
     (async () => {
       await sleep0();
       const res = CFG.map(c => analyseRecording(c));
@@ -953,14 +951,22 @@ step({
       holder.append(para(`<b>What to listen for.</b> For the clarinet the three versions sound the same: its partials already sit at exact
         multiples of the pitch, and only ${pc(res[0].share)} of the deviations fall outside &plusmn;2 s.e. (about 5% is chance).
         For the guitar ${pc(res[1].share)} fall outside: a stiff string pushes its upper partials sharp, so forcing them onto exact
-        multiples changes the sound, most clearly in the bright attack. The left-over is what the model does not explain,
+        multiples changes the sound, most clearly in the bright attack. Placing each partial at its fixed Extension 3 offset
+        from k times the pitch brings it back much closer to the fitted model. The left-over is what the model does not explain,
         played much louder than it really is.`));
     })();
   },
 });
 
 /* Fit every frame of a clip and build the sounds for the Results tab. */
+const CLARINET = { key: "clarinet", name: "Clarinet B♭4", T: 1025, K: 15, start: 0.0, frames: 43, f0: 466.16, color: "s1" };
+const GUITAR = { key: "guitar", name: "Steel guitar D3", T: 3000, K: 12, start: 0.1, frames: 30, f0: 146.83, color: "s2" };
+const ANALYSES = {};
 function analyseRecording(c) {
+  if (ANALYSES[c.key]) return ANALYSES[c.key];
+  return (ANALYSES[c.key] = analyseRecordingNow(c));
+}
+function analyseRecordingNow(c) {
   const a = AUDIO[c.key], fs = a.fs, i0 = Math.round(c.start * fs);
   const frames = H.analyzeFrames(a.x, fs, c.T, c.K, { startS: c.start, nFrames: c.frames, f0hz: c.f0, window: "hann" });
   const n = frames.length, len = n * c.T, original = a.x.slice(i0, i0 + len);
@@ -979,17 +985,23 @@ function analyseRecording(c) {
   // left-over: data minus the frame-by-frame fit
   const resid = new Float64Array(len);
   frames.forEach((F, j) => { for (let t = 0; t < c.T; t++) resid[j * c.T + t] = F.resid[t]; });
-  return { ...c, fs, frames, original, resid, share: out / tot, devCents, bandCents,
-    model: oscillatorBank(frames, c, fs, false), harmonic: oscillatorBank(frames, c, fs, true) };
+  const off = offsetModel(frames, c);
+  const model = oscillatorBank(frames, c, fs, (j, k) => frames[j].freqHz[k]);
+  const harmonic = oscillatorBank(frames, c, fs, (j, k) => (k + 1) * frames[j].freqHz[0]);
+  const offsets = oscillatorBank(frames, c, fs, (j, k) => (k + 1) * Math.exp(off.alpha[j] + off.gamma[k]));
+  // how far each rebuilt version is from the fitted model, as a share of the model's energy
+  const dist = x => { let a = 0, b = 0; for (let i = 0; i < x.length; i++) { a += (x[i] - model[i]) ** 2; b += model[i] ** 2; } return a / b; };
+  return { ...c, fs, frames, original, resid, share: out / tot, devCents, bandCents, model, harmonic, offsets,
+    offsetCents: off.cents, distHarmonic: dist(harmonic), distOffsets: dist(offsets) };
 }
 
 /* Additive resynthesis: one oscillator per partial, with frequency and amplitude moved smoothly from frame centre to
    frame centre and the phase accumulated sample by sample, so there are no clicks at frame boundaries.
-   harmonic = true puts partial k at exactly k times the frame's estimated pitch. */
-function oscillatorBank(frames, c, fs, harmonic) {
+   freqOf(j, k) gives partial k's frequency (Hz) in frame j, k = 0..K-1. */
+function oscillatorBank(frames, c, fs, freqOf) {
   const T = c.T, n = frames.length, len = n * T, y = new Float64Array(len);
   for (let k = 0; k < c.K; k++) {
-    const freq = frames.map(F => harmonic ? (k + 1) * F.freqHz[0] : F.freqHz[k]);
+    const freq = frames.map((F, j) => freqOf(j, k));
     const amp = frames.map(F => F.rho[k]);
     const F0 = frames[0];
     let phase = F0.omega[k] - Math.atan2(F0.B[k], F0.A[k]);
@@ -1004,14 +1016,47 @@ function oscillatorBank(frames, c, fs, harmonic) {
   return y;
 }
 
+/* Extension 3's offset model, log(f_ik / k) = alpha_i + gamma_k, gamma_1 = 0, fitted by weighted least squares with
+   weights (f/se)^2 on the strong partials. Solved by backfitting: alternately update the frame effects and the
+   partial offsets until they stop changing (for this two-way model it converges to the same answer as lm()). */
+function offsetModel(frames, c) {
+  const n = frames.length, K = c.K, y = [], w = [], use = [];
+  for (const F of frames) {
+    const strong = F.rho.map((r, k) => r / F.se.rho[k] >= 8);
+    y.push(F.freqHz.map((f, k) => Math.log(f / (k + 1))));
+    w.push(F.freqHz.map((f, k) => (f / F.seHz[k]) ** 2));
+    use.push(strong.map(v => v && strong[0]));
+  }
+  const alpha = y.map(r => r[0]), gamma = new Array(K).fill(0);
+  for (let it = 0; it < 500; it++) {
+    for (let k = 1; k < K; k++) {
+      let num = 0, den = 0;
+      for (let i = 0; i < n; i++) if (use[i][k]) { num += w[i][k] * (y[i][k] - alpha[i]); den += w[i][k]; }
+      // a partial that is never strong gets its plain average offset
+      gamma[k] = den > 0 ? num / den : y.reduce((s, r, i) => s + r[k] - alpha[i], 0) / n;
+    }
+    let change = 0;
+    for (let i = 0; i < n; i++) {
+      let num = 0, den = 0;
+      for (let k = 0; k < K; k++) if (use[i][k]) { num += w[i][k] * (y[i][k] - gamma[k]); den += w[i][k]; }
+      const a = num / den; change = Math.max(change, Math.abs(a - alpha[i])); alpha[i] = a;
+    }
+    if (change < 1e-13) break;
+  }
+  return { alpha, gamma, cents: gamma.map(g => 1200 * g / Math.LN2) };
+}
+
 function resultBlock(r) {
   const play = (label, x) => el("button", { type: "button", onclick: () => playSamples(x, r.fs) }, label);
   const box = el("div", { class: "result" },
     el("h3", {}, `${r.name}: ${(100 * r.share).toFixed(1)}% of deviations outside ±2 s.e.`),
     el("div", { class: "controls" }, el("span", { class: "lbl" }, "Play"),
       play("original recording", r.original), play("fitted model", r.model),
-      play("partials forced to k × pitch", r.harmonic), play("left-over (amplified)", r.resid),
+      play("partials forced to k × pitch", r.harmonic), play("partials at Extension 3 offsets", r.offsets),
+      play("left-over (amplified)", r.resid),
       el("button", { type: "button", onclick: stopAudio }, "stop")));
+  box.append(el("p", { class: "small" }, `Difference from the fitted model (share of its energy): partials forced to k × pitch
+    ${(100 * r.distHarmonic).toFixed(1)}%, partials at the Extension 3 offsets ${(100 * r.distOffsets).toFixed(1)}%.`));
   const k = r.devCents.map((_, i) => i + 2);
   const f = figure("", `Median deviation of partial k from k times the pitch, in cents (dots), with the median ±2 s.e. band (shaded), over all ${r.frames.length} frames.`);
   box.append(f);
@@ -1145,12 +1190,16 @@ step({
       for frame i and partial k, with &gamma;<sub>1</sub> = 0 and Theorem-2 weights. In R this is
       <code>lm(log(f/k) ~ 0 + factor(frame) + factor(partial), weights = (f/se)^2)</code>. The offsets &gamma;<sub>k</sub> soak up stiffness and anything
       else that stays the same over time; the frame effects &lambda;<sub>i</sub> are the pitch.`));
-    const ctl = el("div", { class: "controls" });
-    ctl.append(el("span", { class: "lbl" }, "Listen"),
-      el("button", { type: "button", onclick: () => playSamples(AUDIO.guitar.x, AUDIO.guitar.fs) }, "steel guitar D3"),
-      el("button", { type: "button", onclick: () => playSamples(AUDIO.clarinet.x, AUDIO.clarinet.fs) }, "clarinet B♭4"),
-      el("button", { type: "button", onclick: stopAudio }, "stop"));
-    stage.append(ctl);
+    const G = analyseRecording(GUITAR);
+    const play = (label, x) => el("button", { type: "button", onclick: () => playSamples(x, G.fs) }, label);
+    stage.append(el("div", { class: "controls" }, el("span", { class: "lbl" }, "Steel guitar"),
+      play("original", G.original), play("fitted model", G.model), play("forced to k × pitch", G.harmonic),
+      play("Extension 3 offsets", G.offsets), el("button", { type: "button", onclick: stopAudio }, "stop")),
+      el("p", { class: "small" }, `Rebuilt in your browser from the frame-by-frame fit. Difference from the fitted model:
+        forced to exact multiples ${(100 * G.distHarmonic).toFixed(1)}% of its energy, Extension 3 offsets
+        ${(100 * G.distOffsets).toFixed(1)}%. The offsets estimated here (periodogram estimator, ${G.frames.length} frames) are
+        ${G.offsetCents.slice(1).map(v => v.toFixed(1)).join(", ")} cents for partials 2–${GUITAR.K}; the plot below uses the
+        report's joint fit.`));
     const k = E.offsets.steel.map((_, i) => i + 1);
     const f1 = figure("", `Estimated offsets ± 2 s.e. Dotted: a stiff string with B = ${E.B_steel.toExponential(1)}. Dashed: the same with partial 1 sitting ${E.shift_steel.toFixed(1)} cents flat.`);
     const kq = linspace(1, 12, 60), CENTS = 1200 / Math.log(2);
